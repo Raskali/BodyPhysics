@@ -1,4 +1,5 @@
 -- Discord Username: @Raskali , Roblox Username: @RaskaliThings
+-- I removed a few functions to make it short enough for review
 --[[
 class-based body physics system
 uses Linear Velocity
@@ -8,8 +9,10 @@ local S_RS = game:GetService("ReplicatedStorage")
 local S_Tween = game:GetService("TweenService")
 local S_Run = game:GetService("RunService")
 local S_Http = game:GetService("HttpService")
+local S_Scripts = game:GetService("ServerScriptService")
 
 local bodyEvent_rev = S_RS:WaitForChild("Remotes").Replication.BodyEvent
+local testerCallbacks = require(S_Scripts.Services.TesterPanelCallbacks)
 
 local sharedTypes = require(S_RS.SharedTypes)
 type Body = sharedTypes.Body
@@ -51,7 +54,7 @@ export type AppliedStates = {
 	StopMovement: {AmountApplied: number, ForceData: ForceData?, yLocked: boolean?};		-- stops movement only
 	StopForces: {AmountApplied: number}; -- stops forces from happening
 	AntiGravity: {AmountApplied: number, ForceData: ForceData?};
-	TargetFacing: {AmountApplied: number, Instances: OrientationInstances?, yLocked: boolean?};
+	TargetFacing: {AmountApplied: number, Instances: OrientationInstances?, yLocked: boolean?}; -- has its own handling in the run connn
 	Invisibility: {AmountApplied: number, InvisParts: {[Part]: number}}; -- {transparent parts}
 }
 
@@ -66,7 +69,9 @@ export type AppliedStateCounter = {
 
 -- misc
 export type AppliedModifiers = {
-	-- target facing isnt a modifier it needs to be running constantly
+	FacePosition: {
+		[string]: {StartTime: number, Duration: number, OrientationInstances: OrientationInstances} -- by ID
+	};
 }
 
 
@@ -106,13 +111,22 @@ export type ForceParams = {
 	Duration: number;
 	MaxForce: Vector3?;
 	Decay: number?;
+	DontAutoEnd: boolean?;
 	RunHitbox: {}?; -- work on this
+	CollisionRaycast: boolean?; -- fires a ray every frame at the body's velocity to detect any collisions. calls end if found
 	StartCallback: (bodyCFrame: CFrame, startTime: number) -> nil?,
-	EndCallback: (bodyCFrame: CFrame, startTime: number, endTime: number) -> nil?,
+	UpdateCallback: (bodyCFrame: CFrame, dt: number, instances: PhysicsInstances) -> nil?,
+	EndCallback: (bodyCFrame: CFrame, startTime: number, endTime: number, endedByCollisionRaycast: true?) -> nil?,
+	Additional: {[string]: any}?;
 }
 
 local DEFAULT_DURATION = 0.25 -- for force applying
 local DEFAULT_MAXFORCE = Vector3.new(50000,50000,50000) -- for force applying
+
+-- for collision raycast
+local raycastParams = RaycastParams.new()
+raycastParams.FilterType = Enum.RaycastFilterType.Include
+raycastParams.FilterDescendantsInstances = {workspace.Map} -- assumes the collision raycast is looking for a map. maybe change in future?
 
 --[[
 =========
@@ -143,7 +157,7 @@ function bodyPhysics.New(body: sharedTypes.Body)
 	newBodyPhysics.AppliedStateCounters = {}
 
 	newBodyPhysics.AppliedModifiers = {}
-	newBodyPhysics.AppliedModifiers.Invisibility = 0
+	newBodyPhysics.AppliedModifiers.FacePosition = {}
 
 	newBodyPhysics.IsTargetFacing = false
 	newBodyPhysics.KnockbackResistance = 0;
@@ -160,6 +174,7 @@ end
 function bodyPhysics:Destroy()
 
 	self.Conn:Disconnect()
+	self.Conn = nil
 	-- remove all forces (they should all be part of ALL at least)
 	self:ClearForces()
 
@@ -186,12 +201,24 @@ function bodyPhysics:InitializeConnection()
 		for i, FD: ForceData in pairs(body.Physics.AppliedForces.All) do
 			if FD.Complete then continue end
 			-- 1) duration check
-			if (now - FD.StartTime) >= FD.Duration then
+			if (now - FD.StartTime) >= FD.Duration and FD.DontAutoEnd ~= true then
 				FD:End(body)
 				continue
 			end
 			--2) update
 			FD:Update(body, dt)
+			--3) raycast perhaps
+			if FD.CollisionRaycast then
+				local origin = body:GetCFrame().Position
+				local direction = FD.Instances.LV.VectorVelocity.Unit
+				local frameDistance = FD.Instances.LV.VectorVelocity.Magnitude * dt
+				local radius = body.Character:GetExtentsSize().Magnitude / 2
+				local raycast: Vector3 = workspace:Raycast(origin, direction * (frameDistance + radius), raycastParams)
+				if raycast then
+					FD:End(body, true)
+				end
+				
+			end
 		end
 		
 		-- check all STATES with a duration. end the increment if duration is up
@@ -208,18 +235,36 @@ function bodyPhysics:InitializeConnection()
 			body.Physics.AppliedStateCounters[index] = nil
 		end
 		
+		-- MISC
+		
+		-- normal facing position
+		for id:string, facePosInfo: AppliedModifiers.FacePosition in pairs(body.Physics.AppliedModifiers.FacePosition) do
+			if (now - facePosInfo.StartTime) >= facePosInfo.Duration then
+				self:RemoveFacePosition(id)
+				continue
+			end
+		end
+		
+		-- facing target position
+		if self.AppliedStates.TargetFacing.Instances then
+			local orientationInstances: OrientationInstances = self.AppliedStates.TargetFacing.Instances
+			local yLocked: boolean = self.AppliedStates.TargetFacing.yLocked
+			
+			local bodyPos: Vector3 = self.Body:GetCFrame().Position
+			local targetPos = self.Body:GetTargetPosition()
+
+			local direction = (targetPos - bodyPos).Unit
+			if yLocked then -- Horizontal look only
+				direction = Vector3.new(direction.X, 0, direction.Z)
+			end
+
+			if direction.Magnitude > 0 then
+				orientationInstances.AO.CFrame = CFrame.lookAt(bodyPos, bodyPos + direction)
+			end
+		end
+		
 	end)
 
-end
-
--- gets the number of forces being applied to this body; ex: "Dash". needs to bc a func because key value is id for forceData
-function bodyPhysics:GetAppliedForceAmount(forceType: string)
-	local appliedForces: AppliedForces = self.AppliedForces
-	local amount = 0
-	for _, _ in pairs(appliedForces[forceType] or {}) do
-		amount += 1
-	end
-	return amount
 end
 
 -- apply a new counter for a state that has a duration. end function should call whataver removes the increment
@@ -254,6 +299,7 @@ end
 --[[
 initialize a new forceData
 unstackable means its a state, not a modular force
+forceParams.CollisionRaycast causes a ray to fire every frame where the body is travelling. if it finds one, it ends the force.
 ]]
 function forceData.New(forceParams:ForceParams, unstackable: boolean?)
 
@@ -263,8 +309,12 @@ function forceData.New(forceParams:ForceParams, unstackable: boolean?)
 	newForceData.MaxForce = forceParams.MaxForce or DEFAULT_MAXFORCE
 	newForceData.Decay = forceParams.Decay or false
 	newForceData.RunHitbox = forceParams.RunHitbox
+	newForceData.DontAutoEnd = forceParams.DontAutoEnd or nil
 	newForceData.StartCallback = forceParams.StartCallback or function() end
+	newForceData.UpdateCallback = forceParams.UpdateCallback or function() end
 	newForceData.EndCallback = forceParams.EndCallback or function() end
+	newForceData.Additional = forceParams.Additional or {}
+	newForceData.CollisionRaycast = forceParams.CollisionRaycast or nil
 	newForceData.Instances = {}
 	newForceData.StartTime = workspace:GetServerTimeNow()
 	newForceData.ForceTypes = {}
@@ -280,6 +330,9 @@ start a force. creates instances and parents them to the body. starts callback
 assumes body exists and all force coniditons have been handled
 ]]
 function forceData:Start(body: Body)
+	
+	-- tester callback
+	testerCallbacks:FireCallback("Force", body:GetCFrame(), self.Velocity, self.Duration)
 
 	-- make attachment o yeah o yeah
 	local att = Instance.new("Attachment")
@@ -315,7 +368,7 @@ function forceData:Start(body: Body)
 
 	-- START CALLBACK
 	self.StartCallback(body.Root.CFrame)
-
+	
 end
 
 -- adds the forceData to an appliedForces table and sets its forceTypes values. assumes body exists
@@ -323,7 +376,6 @@ function forceData:TrackForce(body: Body, forceType: string)
 	assert(body.Physics.AppliedForces[forceType], "Force type does not exist: ".. tostring(forceType))
 	body.Physics.AppliedForces[forceType][self.Id] = self
 	self.ForceTypes[forceType] = true
-	print(body, self)
 end
 
 --[[
@@ -349,26 +401,33 @@ function bodyPhysics:UntrackState(stateType: string): true?
 end
 
 -- runs every heartbeat from initialized bodyphysics conn. assumes body exists
-function forceData:Update(body: Body)
-
+function forceData:Update(body: Body, dt: number)
+	-- just call the update callback
+	self.UpdateCallback(body, dt, self)
 end
 
--- stops the force and clears the object. assums body exists
-function forceData:End(body: Body)
+--[[
+stops the force and clears the object. assumes body exists
+passes endedByCollisionRaycast to the EndCallback
+]]
+function forceData:End(body: Body, endedByCollisionRaycast: boolean?)
 
 	local instances: PhysicsInstances = self.Instances
+	if instances.Tween then
+		instances.Tween:Cancel()
+		instances.Tween = nil
+	end
 	if instances.Attachment then instances.Attachment:Destroy() end
 	self.Complete = true
 	
 	-- END CALLBACK
-	self.EndCallback(body:GetCFrame(), self.StartTime, workspace:GetServerTimeNow())
+	self.EndCallback(body:GetCFrame(), self.StartTime, workspace:GetServerTimeNow(), endedByCollisionRaycast)
 
 	-- remove from all tables its a part of. (stackable force)
 	for forceType:string, _ in pairs(self.ForceTypes) do
 		body.Physics.AppliedForces[forceType][self.Id] = nil
 	end
 	
-	print(body.Physics.AppliedForces)
 
 	setmetatable(self, nil)
 end
@@ -387,7 +446,7 @@ use forceData to set
 unstackable means its an appliedState not force (doesnt get added to "All" table AND is unable to be force stopped AND duration doesnt matter)
 ]]
 function bodyPhysics:ApplyForce(forceParams:ForceParams, unstackable: boolean?): (true?, ForceData)
-
+	
 	local body: Body = self.Body
 	if (not body) or (body.Health.Current == 0) or (not body.Root) then return end
 
@@ -451,15 +510,31 @@ function bodyPhysics:DashToTargetPosition(strength: number, forceParams: ForcePa
 		targetPos = Vector3.new(targetPos.X, self.Body:GetCFrame().Y, targetPos.Z)
 	end
 
-	-- apply endLag to EndCallback
+	-- apply endLag to EndCallback. apply latency if body is a player
 	if endLag then
 		local oldCallback = forceParams.EndCallback or function() end
 
 		forceParams.EndCallback = function(...)
 			
-			self:StopMovement(endLag, true)
+			local params = table.pack(...)
 			
-			oldCallback(...)
+			if self.Body and self.Body.Player then
+				
+				local latency = self.Body.Player:GetNetworkPing() / 2
+				task.delay(latency, function()
+					-- make sure body still exists here
+					if self.Body and self.Body.Root then
+						
+						self:StopMovement(endLag, true)
+
+						oldCallback(table.unpack(params))
+						
+					end
+					
+				end)
+				
+			end
+			
 		end
 	end
 	
@@ -477,7 +552,7 @@ function bodyPhysics:DashToTargetPosition(strength: number, forceParams: ForcePa
 	local moveDirection = self.Body.Humanoid.MoveDirection
 
 	local dot = moveDirection:Dot(directon) -- -1 (opposite) to 1 (same)
-	local movementSimilarityPercent = (dot + 1) / 2 -- convert to 0�1 range
+	local movementSimilarityPercent = (dot + 1) / 2 -- convert to 0–1 range
 	movementSimilarityPercent = math.max(movementSimilarityPercent, 0.1) -- not too small
 
 	local scale = math.sqrt(1 / movementSimilarityPercent)
@@ -485,49 +560,19 @@ function bodyPhysics:DashToTargetPosition(strength: number, forceParams: ForcePa
 
 	forceParams.Velocity *= scale
 	
+	-- facing
+	if not toFacingDirectionInstead then
+		self:FacePosition(targetPos, forceParams and forceParams.Duration or DEFAULT_DURATION)
+	else
+		self:FacePosition(pos + self.Body:GetCFrame().LookVector, forceParams and forceParams.Duration or DEFAULT_DURATION)
+	end
+	
 	--print("MOVEMENT SIMILAITY: ", movementSimilarityPercent, scale)
 	
 	local success: true?, FD: ForceData? = self:ApplyForce(forceParams)
 	-- unsucessful
 	if not success then return end
 	FD:TrackForce(self.Body, "Dash")
-
-	return success, FD
-end
-
-
---[[
-pulls body into a point
-strength of 100 means the body will always be pulled to the center
-]]
-function bodyPhysics:ApplyPull(toPos: Vector3, strength: number, forceParams: ForceParams): (true?, ForceData?)
-	
-	if not self.Body.Root then return end
-
-	local duration = (forceParams and forceParams.Duration) or DEFAULT_DURATION
-	local pos = self.Body.Root.Position
-	local direction = (toPos - pos)
-	local distance = direction.Magnitude
-	if distance == 0 then return end
-
-	local ratio = math.clamp(strength / 100, 0, 1)
-
-	-- instead of ratio * distanceLeft, do ratio * originalDistance
-	local moveDistance = (ratio * distance)
-	local targetPos = pos + direction.Unit * moveDistance
-
-	local newDir = targetPos - pos
-	local velocity = newDir.Unit * (newDir.Magnitude / duration)
-
-	local pullInfo: ForceInfo = forceParams or {}
-	pullInfo.Velocity = velocity
-	pullInfo.Duration = duration
-
-	local success: true?, FD: ForceData? = self:ApplyForce(forceParams)
-	-- unsucessful
-	if not success then return end
-	FD:TrackForce(self.Body, "Pull")
-
 	return success, FD
 end
 
@@ -551,8 +596,6 @@ function bodyPhysics:StopForces(duration: number?): true?
 	-- should apply unique force
 	if shouldApply  then
 		return true
-	else
-		
 	end
 	
 end
@@ -604,7 +647,6 @@ function bodyPhysics:StopMovement(duration: number?, yLocked: boolean?, alsoStop
 		self.AppliedStates.StopMovement.ForceData = FD
 		self.AppliedStates.StopMovement.ForceData.Instances.Attachment.Name = "StopMovementAtt"
 		self.AppliedStates.StopMovement.yLocked = yLocked
-		print(self.AppliedStates.StopMovement)
 		
 		return true -- new applied force
 		
@@ -647,6 +689,206 @@ function bodyPhysics:ResumeMovement(alsoResumeForce: boolean?): true?
 		return true -- successful remove
 	end
 	
+end
+
+--[[
+begins facing where the body's target is
+returns true if new application
+]]
+function bodyPhysics:StartTargetFacing(dontyLock: boolean?, duration:number?): true?
+	
+	local yLocked = not dontyLock
+	
+	-- increment one to movement stoppers
+	-- this func returns true if the applied amount is one AND returns the 2nd param value of its current table
+	local shouldApply: true?, wasyLocked:boolean? = self:TrackState("TargetFacing", "yLocked")
+
+	-- if there's a duration then attach a counter
+	if duration then
+		self:ApplyStateCounter(duration, "TargetFacing", function()
+			self:StopTargetFacing()
+		end)
+	end
+
+	-- should apply unique force
+	if shouldApply  then
+		local orientationInstances: OrientationInstances = make_align_orientation(self.Body)
+
+		local bodyPos: Vector3 = self.Body:GetCFrame().Position
+		local targetPos = self.Body:GetTargetPosition()
+		
+		self.Body.Humanoid.PlatformStand = true
+
+		local direction = (targetPos - bodyPos).Unit
+		if yLocked then -- Horizontal look only
+			direction = Vector3.new(direction.X, 0, direction.Z)
+		end
+
+		if direction.Magnitude > 0 then
+			orientationInstances.AO.CFrame = CFrame.lookAt(bodyPos, bodyPos + direction)
+		end
+		
+		self.AppliedStates.TargetFacing.Instances = orientationInstances
+		self.AppliedStates.TargetFacing.yLocked = yLocked
+
+		return true -- new applied force
+
+	else
+
+		self.AppliedStates.TargetFacing.yLocked = yLocked
+
+	end
+	
+end
+
+--[[
+body stops facing its target position
+returns true if successful stop
+]]
+function bodyPhysics:StopTargetFacing(): true?
+	
+	-- increment -1 from movement stoppers
+	-- this func returns true if the applied amount is zero
+	local shouldStopApplying: true? = self:UntrackState("TargetFacing")
+
+	if shouldStopApplying then
+		
+		local att = self.AppliedStates.TargetFacing.Instances.Attachment
+		self.AppliedStates.TargetFacing.Instances = nil
+		self.AppliedStates.TargetFacing.yLocked = nil
+		att:Destroy()
+		
+		return true -- successful remove
+	end
+	
+end
+
+--[[
+constantly pulls the body to the center of a hitbox, so if the hitbox moves the center moves too.
+applied using the hitbox function :CreatePullHitbox. there is no duration parameter because :RemoveConstantPull() should be called
+by the hitbox service when the hitbox is about to be removed.
+]]
+function bodyPhysics:ApplyConstantPull(strength: number, forceParams: ForceParams): (true?, ForceData?)
+
+	if not self.Body.Root then return end
+	if not forceParams.RunHitbox then warn("Need a hitbox to apply constant pull force, didnt get any.") return end
+	
+	forceParams.DontAutoEnd = true -- so it doesnt stop when the duration is up
+	-- inject strength into additional data for forceparams so it can be used in the update function
+	forceParams.Additional = {
+		Strength = strength
+	}
+	
+	local duration = (forceParams and forceParams.Duration) or DEFAULT_DURATION
+	
+	-- this is what calculates the velocity of the pull. used initially on ApplyForce and for the update callback
+	local function calculate_velocity(toPos: Vector3): Vector3
+		local pos = self.Body.Root.Position
+		local direction = (toPos - pos)
+		local distance = direction.Magnitude
+
+		local ratio = math.clamp(strength / 100, 0, 1)
+
+		-- instead of ratio * distanceLeft, do ratio * originalDistance
+		local moveDistance = (ratio * distance)
+		local targetPos = pos + direction.Unit * moveDistance
+
+		local newDir = targetPos - pos
+		local velocity = newDir.Unit * (newDir.Magnitude / duration)
+		
+		return velocity
+	end
+
+	local pullInfo: ForceParams = forceParams or {}
+	pullInfo.Velocity = calculate_velocity(forceParams.RunHitbox.Position)
+	pullInfo.Duration = duration
+	
+	-- # RUN EVERY FRAME 
+	forceParams.UpdateCallback = function(bodyCFrame: CFrame, dt: number, forceData:  ForceData)
+		
+		-- if hitbox was deleted
+		if not forceData.RunHitbox or forceData.RunHitbox.Parent == nil then
+			bodyPhysics:RemoveConstantPull(forceData.Id)
+		end
+		
+		local LV = forceData.Instances.LV
+		forceData.Velocity = calculate_velocity(forceData.RunHitbox.Position)
+		LV.VectorVelocity = forceData.Velocity
+		
+	end
+
+	local success: true?, FD: ForceData? = self:ApplyForce(forceParams)
+	-- unsucessful
+	if not success then return end
+	
+	FD:TrackForce(self.Body, "Pull")
+
+	return success, FD
+end
+
+--[[
+removes a specific constant pull effect. used by hitbox service when a pull hitbox is about to be deleted
+]]
+function bodyPhysics:RemoveConstantPull(forceId: string)
+	if not self.AppliedForces then return end
+	-- find the force and end it
+	for i, FD: ForceData in pairs(self.AppliedForces.Pull) do
+		if FD.Id == forceId then FD:End(self.Body) return end
+	end
+end
+
+--[[
+=========
+@ MISC FUNCTIONS
+=========
+]]
+
+-- params to see if body is airborne
+local airborneParams = RaycastParams.new()
+airborneParams.RespectCanCollide = true
+airborneParams.FilterDescendantsInstances = {workspace.Map}
+airborneParams.FilterType = Enum.RaycastFilterType.Include
+
+--[[
+misc: checks if a body is currently in the air
+]]
+function bodyPhysics:IsAirborne(): boolean
+
+	if not self.Body.Root then return end
+
+	-- get size
+	local charSize = self.Body.Character:GetExtentsSize()
+
+	local rayOrigin = self.Body:GetCFrame().Position
+	local rayDirection = Vector3.new(0, -charSize.Y * 1.2, 0) -- 1.2x the size
+
+	local result = workspace:Raycast(rayOrigin, rayDirection, airborneParams)
+
+	return (result == nil)
+end
+
+--[[
+makes an align orientation parented to an attachment parented to the body's root
+assumes body exists
+doesnt set cframe
+returns the info
+]]
+function make_align_orientation(body:Body): OrientationInstances
+	
+	-- Create AlignOrientation for awesome rotation
+	local att = Instance.new("Attachment")
+	att.Name = "TurnAttachment"
+	att.Parent = body.Root
+
+	local align = Instance.new("AlignOrientation")
+	align.Mode = Enum.OrientationAlignmentMode.OneAttachment
+	align.Responsiveness = 999
+	align.RigidityEnabled = true
+	align.ReactionTorqueEnabled = true
+	align.Attachment0 = att
+	align.Parent = att
+	
+	return {Attachment = att; AO = align}
 end
 
 return bodyPhysics
